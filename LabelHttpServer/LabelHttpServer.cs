@@ -303,10 +303,6 @@ namespace LabelHttpServer
                 {
                     returnObj = HandlePostFile(request, response);
                 }
-                //if (tempurl == "/LABEL" || tempurl == "/LABEL/")
-                //{
-                //    returnObj = HandlePostLABEL(request, response);
-                //}
             }
             if (request.HttpMethod == "GET")
             {
@@ -347,23 +343,38 @@ namespace LabelHttpServer
                 {
                     if (request.ContentType.Contains("multipart/form-data"))
                     {
-                        HttpMultipartParser parser = new HttpMultipartParser(request.InputStream, request.ContentEncoding, "");
-                        if (parser.Success)
+                        Dictionary<string, string> args = new Dictionary<string, string>();
+                        Dictionary<string, HttpFile> files = RequestMultipartExtensions.ParseMultipartForm(request, args);
+                        if (args.ContainsKey("tspl"))
                         {
-                            if (parser.Parameters.ContainsKey("tspl"))
+                            data = args["tspl"];
+                            byte[] byteArr = request.ContentEncoding.GetBytes(data);
+                            byteList.AddRange(byteArr);
+                        }
+                        else
+                        {
+                            throw new Exception("Not found 'tspl' in multipart/form-data .");
+                        }
+                    }
+                    if (request.ContentType.Contains("application/x-www-form-urlencoded"))
+                    {
+                        Dictionary<string, string> args = new Dictionary<string, string>();
+                        if (RequestFormExtensions.ParseForm(request, args))
+                        {
+                            if (args.ContainsKey("tspl"))
                             {
-                                data = parser.Parameters["tspl"];
+                                data = args["tspl"];
                                 byte[] byteArr = request.ContentEncoding.GetBytes(data);
                                 byteList.AddRange(byteArr);
                             }
                             else
                             {
-                                throw new Exception("Parser Content to TSPL Error");
+                                throw new Exception("Not found 'tspl' in application/x-www-form-urlencoded .");
                             }
                         }
                         else
                         {
-                            throw new Exception("Parser Content to TSPL Error");
+                            throw new Exception("Parse application/x-www-form-urlencoded Error");
                         }
                     }
                     if (request.ContentType.Contains("text/plain"))
@@ -446,8 +457,7 @@ namespace LabelHttpServer
             {
                 //转存文件
                 Dictionary<string, string> args = new Dictionary<string, string>();
-                RequestMultipartExtensions requestMultipartExtensions = new RequestMultipartExtensions();
-                Dictionary<string, HttpFile> files = requestMultipartExtensions.ParseMultipartForm(request, args, (n, fn, ct) => new MemoryStream());
+                Dictionary<string, HttpFile> files = RequestMultipartExtensions.ParseMultipartForm(request, args);
                 string TempID = "";
                 string JsonStr = "";
                 foreach (var f in files.Values)
@@ -562,118 +572,6 @@ namespace LabelHttpServer
             response.StatusDescription = "200";//获取或设置返回给客户端的 HTTP 状态代码的文本说明。
             response.StatusCode = 200;// 获取或设置返回给客户端的 HTTP 状态代码。
             ShowMsg(StringMsgType.Info, "Printer", $"打印标签完成.");
-            return "OK";
-        }
-
-        private string HandlePostLABEL(HttpListenerRequest request, HttpListenerResponse response)
-        {
-            string TempID = "";
-            string JsonStr = "";
-            try
-            {
-                var byteList = new List<byte>();
-
-                if (request.ContentType != null)
-                {
-                    if (request.ContentType.Contains("multipart/form-data"))
-                    {
-                        HttpMultipartParser parser = new HttpMultipartParser(request.InputStream, request.ContentEncoding, "");
-                        if (parser.Success)
-                        {
-                            if (parser.Parameters.ContainsKey("tempid") && parser.Parameters.ContainsKey("jsonstr"))
-                            {
-                                TempID = parser.Parameters["tempid"];
-                                JsonStr = parser.Parameters["jsonstr"];
-                            }
-                            else
-                            {
-                                throw new Exception("Parser Content to Label Error");
-                            }
-                        }
-                        else
-                        {
-                            throw new Exception("Parser Content to TSPL Error");
-                        }
-                    }
-                }
-
-                Dictionary<string, string> NewParms = JsonConvert.DeserializeObject<Dictionary<string, string>>(JsonStr);
-                string LabelPath = TSCDirectory + $"{TempID}.btw";
-
-                string result = "";
-                //获取得到数据data可以进行其他操作
-                if (usbprint.openport())
-                {
-                    byte state = usbprint.printerstatus();
-                    //ShowMsg(StringMsgType.Info, "Printer", "打印机状态=" + state.ToString());
-                    if (state != 0)
-                    {
-                        ShowMsg(StringMsgType.Warning, "Printer", usbprint.printerstatus_string());
-                        result = "ERROR, TSC printer not ready";
-                        if (state == 2)
-                        {
-                            result = "ERROR, paper stuck in TSC Printer";
-                        }
-                        if (state == 4)
-                        {
-                            result = "ERROR, TSC Printer is out of paper";
-                        }
-                        response.StatusDescription = "404";
-                        response.StatusCode = 404;
-                        return result;
-                    }
-                    else
-                    {
-                        //实例化一个对象
-                        var btEngine = new Engine();
-                        btEngine.Window.Visible = false;
-                        //开始打印
-                        btEngine.Start();
-                        //打开模板
-                        //var btFormat = btEngine.Documents.Open("D:\\文档1.btw");
-                        var btFormat = btEngine.Documents.Open(TempID);
-                        //设置变量值(可选)
-                        //btFormat.SubStrings["SubName"].Value = "1234";
-                        foreach (string key in NewParms.Keys)
-                        {
-                            btFormat.SubStrings[key].Value = NewParms[key];
-                        }
-                        //设置打印机名称
-                        btFormat.PrintSetup.PrinterName = printer;
-                        //设置打印张数
-                        btFormat.PrintSetup.IdenticalCopiesOfLabel = 1;
-                        //开始打印
-                        var pric = btFormat.Print("PrintingJobName");
-                        //关闭文档
-                        btFormat.Close(SaveOptions.DoNotSaveChanges);
-                        //结束打印
-                        btEngine.Stop();
-                        //释放对象
-                        btEngine.Dispose();
-
-                        response.StatusDescription = "200";
-                        response.StatusCode = 200;
-                    }
-                }
-                else
-                {
-                    ShowMsg(StringMsgType.Warning, "Printer", "USB not open");
-                    result = "ERROR, USB not open";
-                    response.StatusDescription = "404";
-                    response.StatusCode = 404;
-                    return result;
-                }
-            }
-            catch (Exception ex)
-            {
-                response.StatusDescription = "404";
-                response.StatusCode = 404;
-                ShowMsg(StringMsgType.Error, "Printer", $"打印标签[{TempID}]失败:{ex.Message}.");
-                return $"ERROR, {ex.Message}";
-            }
-            response.StatusDescription = "200";//获取或设置返回给客户端的 HTTP 状态代码的文本说明。
-            response.StatusCode = 200;// 获取或设置返回给客户端的 HTTP 状态代码。
-            ShowMsg(StringMsgType.Info, "Printer", $"打印标签[{TempID}]完成, json: {JsonStr}.");
             return "OK";
         }
 

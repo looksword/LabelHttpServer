@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -20,193 +21,281 @@ namespace LabelHttpServer
     }
 
     /// <summary>
-    /// multipart/form-data的解析器
+    /// HTTP file data container.
     /// </summary>
-    internal class HttpMultipartParser
+    public class HttpFile : IDisposable
     {
         /// <summary>
-        /// 参数集合
+        /// Creates new HTTP file data container.
         /// </summary>
-        public IDictionary<string, string> Parameters = new Dictionary<string, string>();
+        /// <param name="fileName">File name.</param>
+        /// <param name="value">Data.</param>
+        /// <param name="contentType">Content type.</param>
+        internal HttpFile(string fileName, Stream value, string contentType)
+        {
+            Value = value;
+            FileName = fileName;
+            ContentType = contentType;
+        }
+
         /// <summary>
-        /// 上传文件部分参数
+        /// Gets the name of the file.
         /// </summary>
-        public string FilePartName { get; }
+        public string FileName { get; private set; }
+
         /// <summary>
-        /// 是否解析成功
+        /// Gets the data.
+        /// <para>If a stream is created <see cref="OnFile"/> it will be closed when this HttpFile object is disposed.</para>
         /// </summary>
-        public bool Success { get; private set; }
+        public Stream Value { get; private set; }
+
         /// <summary>
-        /// 请求类型
+        /// Content type.
         /// </summary>
         public string ContentType { get; private set; }
-        /// <summary>
-        /// 上传的文件名
-        /// </summary>
-        public string Filename { get; private set; }
-        /// <summary>
-        /// 上传的文件内容
-        /// </summary>
-        public List<byte[]> FileContents { get; private set; }
 
         /// <summary>
-        /// 解析multipart/form-data格式的文件请求，默认编码为utf8
+        /// Saves the data into a file.
+        /// <para>Directory path will be auto created if does not exists.</para>
         /// </summary>
-        /// <param name="stream"></param>
-        /// <param name="filePartName"></param>
-        public HttpMultipartParser(Stream stream, string filePartName)
+        /// <param name="fileName">File path with name.</param>
+        /// <param name="overwrite">True to overwrite the existing file, false otherwise.</param>
+        /// <returns>True if the file is saved/overwritten, false otherwise.</returns>
+        public bool Save(string fileName, bool overwrite = false)
         {
-            FileContents = new List<byte[]>();
-            FilePartName = filePartName;
-            Parse(stream, Encoding.UTF8);
+            if (File.Exists(Path.GetFullPath(fileName)))
+                File.Delete(Path.GetFullPath(fileName));
+
+            var dir = Path.GetDirectoryName(Path.GetFullPath(fileName));
+            Directory.CreateDirectory(dir);
+
+            Value.Position = 0;
+            using (var outStream = File.OpenWrite(fileName))
+                Value.CopyTo(outStream);
+
+            return true;
         }
 
         /// <summary>
-        /// 解析multipart/form-data格式的字符串
+        /// Disposes the current instance.
         /// </summary>
-        /// <param name="content"></param>
-        public HttpMultipartParser(string content)
+        public void Dispose()
         {
-            FileContents = new List<byte[]>();
-            var array = Encoding.UTF8.GetBytes(content);
-            var stream = new MemoryStream(array);
-            Parse(stream, Encoding.UTF8);
-        }
-
-        /// <summary>
-        /// 解析multipart/form-data格式的文件请求
-        /// </summary>
-        /// <param name="stream"></param>
-        /// <param name="encoding">编码</param>
-        /// <param name="filePartName"></param>
-        public HttpMultipartParser(Stream stream, Encoding encoding, string filePartName)
-        {
-            FileContents = new List<byte[]>();
-            FilePartName = filePartName;
-            Parse(stream, encoding);
-        }
-
-        private void Parse(Stream stream, Encoding encoding)
-        {
-            Success = false;
-
-            var data = ToByteArray(stream);
-
-            var content = encoding.GetString(data);
-
-            var delimiterEndIndex = content.IndexOf("\r\n", StringComparison.Ordinal);
-
-            if (delimiterEndIndex > -1)
+            if (Value != null)
             {
-                var delimiter = content.Substring(0, content.IndexOf("\r\n", StringComparison.Ordinal)).Trim();
+                Value?.Dispose();
+                Value = null;
+            }
+        }
 
-                var sections = content.Split(new[] { delimiter }, StringSplitOptions.RemoveEmptyEntries);
+        /// <summary>
+        /// Disposes the current instance.
+        /// </summary>
+        ~HttpFile()
+        {
+            Dispose();
+        }
+    }
 
-                foreach (var s in sections)
+    /// <summary>
+    /// multipart/form-data
+    /// </summary>
+    public static class RequestMultipartExtensions
+    {
+        public static Dictionary<string, HttpFile> ParseMultipartForm(HttpListenerRequest request, Dictionary<string, string> args)
+        {
+            if (request.ContentType.StartsWith("multipart/form-data") == false)
+                throw new InvalidDataException("Not 'multipart/form-data'.");
+
+            var boundary = Regex.Match(request.ContentType, "boundary=(.+)").Groups[1].Value;
+            boundary = "--" + boundary;
+
+
+            var files = new Dictionary<string, HttpFile>();
+            var inputStream = new BufferedStream(request.InputStream);
+
+            parseUntillBoundaryEnd(inputStream, new MemoryStream(), boundary);
+            while (true)
+            {
+                var (n, v, fn, ct) = parseSection(inputStream, "\r\n" + boundary);
+                if (String.IsNullOrEmpty(n)) break;
+
+                v.Position = 0;
+                if (!String.IsNullOrEmpty(fn))
+                    files.Add(n, new HttpFile(fn, v, ct));
+                else
+                    args.Add(n, readAsStringUtf8(v));
+            }
+
+            return files;
+        }
+
+        private static (string Name, Stream Value, string FileName, string ContentType) parseSection(Stream source, string boundary)
+        {
+            var (n, fn, ct) = readContentDisposition(source);
+            source.ReadByte(); source.ReadByte(); //\r\n (empty row)
+
+            //var dst = String.IsNullOrEmpty(fn) ? new MemoryStream() : onFile(n, fn, ct);//文件名是否为空
+            var dst = new MemoryStream();
+            //if (dst == null)
+            //    throw new ArgumentException(nameof(onFile), "The on-file callback must return a stream.");
+
+            parseUntillBoundaryEnd(source, dst, boundary);
+
+            return (n, dst, fn, ct);
+        }
+
+        private static (string Name, string FileName, string ContentType) readContentDisposition(Stream stream)
+        {
+            const string UTF_FNAME = "utf-8''";
+
+            var l = readLineUtf8(stream);
+            if (String.IsNullOrEmpty(l))
+                return (null, null, null);
+
+            //(regex matches are taken from NancyFX) and modified
+            var n = Regex.Match(l, @"name=""?(?<n>[^\""]*)").Groups["n"].Value;
+            var f = Regex.Match(l, @"filename\*?=""?(?<f>[^\"";]*)").Groups["f"]?.Value;
+
+            string cType = null;
+            if (!String.IsNullOrEmpty(f))
+            {
+                if (f.StartsWith(UTF_FNAME))
+                    f = Uri.UnescapeDataString(f.Substring(UTF_FNAME.Length));
+
+                l = readLine(stream);
+                cType = Regex.Match(l, "Content-Type: (?<cType>.+)").Groups["cType"].Value;
+            }
+
+            return (n, f, cType);
+        }
+
+        private static void parseUntillBoundaryEnd(Stream source, Stream destination, string boundary)
+        {
+            var checkBuffer = new byte[boundary.Length]; //for boundary checking
+
+            int b, i = 0;
+            while ((b = source.ReadByte()) != -1)
+            {
+                if (i == boundary.Length) //boundary found -> go to the end of line
                 {
-                    if (s.Contains("Content-Disposition"))
-                    {
-                        var nameMatch = new Regex(@"(?<=name\=\"")(.*?)(?=\"")").Match(s);
-                        string name = nameMatch.Value.Trim().ToLower();
-
-                        if (name == FilePartName && !string.IsNullOrEmpty(FilePartName))
-                        {
-                            var re = new Regex(@"(?<=Content\-Type:)(.*?)(?=\r\n\r\n)");
-                            var contentTypeMatch = re.Match(s);
-
-                            re = new Regex(@"(?<=filename\=\"")(.*?)(?=\"")");
-                            var filenameMatch = re.Match(s);
-
-                            if (contentTypeMatch.Success && filenameMatch.Success)
-                            {
-                                ContentType = contentTypeMatch.Value.Trim();
-                                Filename = filenameMatch.Value.Trim();
-
-                                int startIndex = contentTypeMatch.Index + contentTypeMatch.Length + "\r\n\r\n".Length;
-
-                                string tempfilestr = s.Substring(startIndex);
-
-                                int templen = tempfilestr.Length;
-                                tempfilestr = tempfilestr.Remove(templen - 2);//去除默认\r\n
-
-                                byte[] fileData = encoding.GetBytes(tempfilestr);
-
-                                //var delimiterBytes = encoding.GetBytes("\r\n" + delimiter);
-                                //var endIndex = IndexOf(data, delimiterBytes, startIndex);
-
-                                //var contentLength = endIndex - startIndex;
-
-                                //var fileData = new byte[contentLength];
-
-                                //Buffer.BlockCopy(data, startIndex, fileData, 0, contentLength);
-
-                                FileContents.Add(fileData);
-                            }
-                        }
-                        else if (!string.IsNullOrWhiteSpace(name))
-                        {
-                            var startIndex = nameMatch.Index + nameMatch.Length + "\r\n\r\n".Length;
-                            Parameters.Add(name, s.Substring(startIndex).TrimEnd('\r', '\n').Trim());
-                        }
-                    }
+                    if (b == '\n') break;
+                    continue;
                 }
 
-                if (FileContents.Count != 0 || Parameters.Count != 0)
+                if (b == boundary[i]) //start filling the check buffer
                 {
-                    Success = true;
+                    checkBuffer[i] = (byte)b;
+                    i++;
+                }
+                else
+                {
+                    var idx = 0;
+                    while (idx < i) //write the buffer data to stream
+                    {
+                        destination.WriteByte(checkBuffer[idx]);
+                        idx++;
+                    }
+
+                    i = 0;
+                    destination.WriteByte((byte)b); //write the current byte
                 }
             }
         }
 
-        public static int IndexOf(byte[] searchWithin, byte[] serachFor, int startIndex)
+        private static string readLine(Stream stream)
         {
-            var index = 0;
-            var startPos = Array.IndexOf(searchWithin, serachFor[0], startIndex);
+            var sb = new StringBuilder();
 
-            if (startPos != -1)
+            int b;
+            while ((b = stream.ReadByte()) != -1 && b != '\n')
             {
-                while (startPos + index < searchWithin.Length)
-                {
-                    if (searchWithin[startPos + index] == serachFor[index])
-                    {
-                        index++;
-                        if (index == serachFor.Length)
-                        {
-                            return startPos;
-                        }
-                    }
-                    else
-                    {
-                        startPos = Array.IndexOf(searchWithin, serachFor[0], startPos + index);
-                        if (startPos == -1)
-                        {
-                            return -1;
-                        }
-
-                        index = 0;
-                    }
-                }
+                sb.Append((char)b);
             }
 
-            return -1;
+            if (sb.Length > 0 && sb[sb.Length - 1] == '\r')
+                sb.Remove(sb.Length - 1, 1);
+
+            return sb.ToString();
         }
 
-        public static byte[] ToByteArray(Stream stream)
+        private static string readAsString(Stream stream)
         {
-            var buffer = new byte[32768];
-            using (var ms = new MemoryStream())
-            {
-                while (true)
-                {
-                    var read = stream.Read(buffer, 0, buffer.Length);
-                    if (read <= 0)
-                    {
-                        return ms.ToArray();
-                    }
+            var sb = new StringBuilder();
 
-                    ms.Write(buffer, 0, read);
-                }
+            int b;
+            while ((b = stream.ReadByte()) != -1)
+                sb.Append((char)b);
+
+            return sb.ToString();
+        }
+
+        private static string readLineUtf8(Stream stream)
+        {
+            List<byte> bytes = new List<byte>();
+
+            int b;
+            while ((b = stream.ReadByte()) != -1 && b != '\n')
+            {
+                bytes.Add((byte)b);
             }
+
+            if (bytes.Count > 0 && bytes[bytes.Count - 1] == '\r')
+                bytes.RemoveAt(bytes.Count - 1);
+
+            return Encoding.UTF8.GetString(bytes.ToArray());
+        }
+
+        private static string readAsStringUtf8(Stream stream)
+        {
+            List<byte> bytes = new List<byte>();
+
+            int b;
+            while ((b = stream.ReadByte()) != -1)
+                bytes.Add((byte)b);
+
+            return Encoding.UTF8.GetString(bytes.ToArray());
+        }
+    }
+
+    /// <summary>
+    /// application/x-www-form-urlencoded
+    /// </summary>
+    public static class RequestFormExtensions
+    {
+        public static bool ParseForm(HttpListenerRequest request, Dictionary<string, string> args)
+        {
+            if (request.ContentType != "application/x-www-form-urlencoded")
+                return false;
+
+            var str = BodyAsString(request);
+            if (str == null)
+                return false;
+
+            foreach (var pair in str.Split('&'))
+            {
+                var nameValue = pair.Split('=');
+                if (nameValue.Length != (1 + 1))
+                    continue;
+
+                args.Add(nameValue[0], WebUtility.UrlDecode(nameValue[1]));
+            }
+
+            return true;
+        }
+
+        static string BodyAsString(HttpListenerRequest request)
+        {
+            if (!request.HasEntityBody)
+                return null;
+
+            string str = null;
+            using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+            {
+                str = reader.ReadToEnd();
+            }
+
+            return str;
         }
     }
 }
